@@ -17,7 +17,7 @@ On shutdown, the bind mounts are cleaned up automatically.
 Open Konsole (the terminal app in desktop mode) and paste this:
 
 ```bash
-curl -sL https://github.com/YOUR_USERNAME/egpu-switcher/raw/main/egpu-switcher.sh -o ~/Desktop/egpu-switcher.sh && chmod +x ~/Desktop/egpu-switcher.sh && bash ~/Desktop/egpu-switcher.sh
+curl -sL https://github.com/Chazwasa/egpu-switcher/raw/main/egpu-switcher.sh -o ~/Desktop/egpu-switcher.sh && chmod +x ~/Desktop/egpu-switcher.sh && bash ~/Desktop/egpu-switcher.sh
 ```
 
 This downloads the script, makes it runnable, and launches the installer GUI — all in one step. Follow the prompts, then reboot with your eGPU dock connected.
