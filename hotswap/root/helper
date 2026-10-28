@@ -1,0 +1,209 @@
+#!/bin/bash
+# egpu-switcher root helper, run by egpu-switcher-helper.service. It takes one-line requests from a FIFO that only
+# root and the deck group can write, and ignores anything else.
+#
+#   game-mode-on-egpu  From the session wrapper. While Game Mode runs on the eGPU nothing drives the built-in screen,
+#                      so the kernel's framebuffer console lights it (backlight on, picture black); this turns it off.
+#                      Decided by gamescope's own command line, not by the message.
+#   fence TOKEN        First step of a safe eject: the eGPU's device files can no longer be opened, so programs
+#                      restarted after this leave the eGPU alone.
+#   unfence TOKEN      Undoes fence, for an eject that did not go ahead.
+#   eject TOKEN        Takes the eGPU off the PCI bus once nothing has it open.
+#   attach TOKEN       Brings an ejected eGPU back without replugging (PCI rescan).
+#
+# A request with a TOKEN is answered in $RESULT as "TOKEN ok|failed|none DETAIL".
+
+FIFO=/run/egpu-switcher/cmd
+RESULT=/run/egpu-switcher/result
+
+log() { echo "$*" >&2; }
+
+# answer TOKEN ok|failed|none DETAIL...
+answer() {
+    local token=$1
+    shift
+    log "$*"
+    echo "$token $*" > "$RESULT.tmp" && mv -f "$RESULT.tmp" "$RESULT"
+}
+
+# Prints the sysfs directory of the first removable display-class GPU bound to a driver.
+find_egpu() {
+    local dev class
+    for dev in /sys/bus/pci/devices/*; do
+        class=$(cat "$dev/class" 2>/dev/null) || continue
+        case "$class" in 0x0300*|0x0302*|0x0380*) ;; *) continue ;; esac
+        [ "$(cat "$dev/removable" 2>/dev/null)" = removable ] || continue
+        [ -L "$dev/driver" ] || continue
+        echo "$dev"
+        return 0
+    done
+    return 1
+}
+
+# Prints the device files of the eGPU and of the sound cards in the same slot (its HDMI/DP audio).
+egpu_nodes() {
+    local slot node card n
+    slot=$(readlink -f "$1")
+    slot=${slot%.*}.
+    for node in "$1"/drm/card* "$1"/drm/renderD*; do
+        [ -e "$node" ] && echo "/dev/dri/${node##*/}"
+    done
+    for card in /sys/class/sound/card*; do
+        case "$(readlink -f "$card/device")" in "$slot"*) ;; *) continue ;; esac
+        n=${card##*card}
+        for node in /dev/snd/controlC"$n" /dev/snd/hwC"$n"D* /dev/snd/pcmC"$n"D*; do
+            [ -e "$node" ] && echo "$node"
+        done
+    done
+}
+
+# Prints "name(pid)" for every process that has one of the given files open.
+held_by() {
+    local pid out=""
+    for pid in $(fuser "$@" 2>/dev/null | tr -s ' ' '\n' | sort -un); do
+        out+=" $(cat "/proc/$pid/comm" 2>/dev/null)($pid)"
+    done
+    echo "${out# }"
+}
+
+# The device right below the root port on the way to the eGPU: removing it takes the eGPU and the dock's bridges
+# off the bus in one step.
+dock_top() {
+    local path
+    path=$(readlink -f "$1")
+    path=${path#/sys/devices/pci*/}
+    path=${path#*/}
+    echo "/sys/bus/pci/devices/${path%%/*}"
+}
+
+gamescope_on_egpu() {
+    local pid
+    for pid in $(pgrep -x gamescope-wl); do
+        grep -qz -- '^--prefer-vk-device$' "/proc/$pid/cmdline" && return 0
+    done
+    return 1
+}
+
+# Prints the built-in screen's connector and the framebuffer on the same GPU: "CONNECTOR_DIR FB_DIR".
+find_panel() {
+    local conn gpu fb
+    for conn in /sys/class/drm/card*-eDP-*; do
+        [ -e "$conn" ] || continue
+        gpu=$(readlink -f "$conn")
+        gpu=${gpu%/drm/*}
+        for fb in /sys/class/graphics/fb*; do
+            [ "$(readlink -f "$fb")" = "$gpu/graphics/${fb##*/}" ] || continue
+            echo "$conn $fb"
+            return 0
+        done
+    done
+    return 1
+}
+
+panel_off() {
+    local panel conn fb i
+    panel=$(find_panel) || { log "no built-in screen found"; return; }
+    read -r conn fb <<< "$panel"
+    for ((i = 0; i < 30; i++)); do
+        gamescope_on_egpu && break
+        sleep 1
+    done
+    gamescope_on_egpu || { log "Game Mode is not on the eGPU: leaving the built-in screen alone"; return; }
+    # The console relights the screen when the last program using the built-in GPU's display closes, which
+    # can be after gamescope has started on the eGPU, so keep checking for a while.
+    for ((i = 0; i < 15; i++)); do
+        if [ "$(cat "$conn/dpms")" = On ]; then
+            # 0 first: the console relit the screen without changing the stored value, and the kernel may skip
+            # a write equal to it.
+            echo 0 > "$fb/blank"
+            echo 4 > "$fb/blank"
+            log "built-in screen turned off (${conn##*/}, ${fb##*/})"
+        fi
+        sleep 1
+    done
+}
+
+fence() {
+    local gpu nodes
+    gpu=$(find_egpu) || { answer "$1" none "no eGPU attached"; return; }
+    mapfile -t nodes < <(egpu_nodes "$gpu")
+    # Mode 000 also clears the ACL mask, which switches off the access logind grants the logged-in user.
+    chmod 000 "${nodes[@]}"
+    answer "$1" ok "fenced ${nodes[*]}"
+}
+
+unfence() {
+    local gpu nodes node paths=()
+    gpu=$(find_egpu) || { answer "$1" none "no eGPU attached"; return; }
+    mapfile -t nodes < <(egpu_nodes "$gpu")
+    for node in "${nodes[@]}"; do
+        case $node in
+            /dev/dri/*) paths+=("/sys/class/drm/${node##*/}") ;;
+            /dev/snd/*) paths+=("/sys/class/sound/${node##*/}") ;;
+        esac
+    done
+    # udev applies the usual modes and ACLs again.
+    udevadm trigger --action=change --settle "${paths[@]}"
+    answer "$1" ok "unfenced ${nodes[*]}"
+}
+
+eject() {
+    local gpu top nodes held i
+    gpu=$(find_egpu) || { answer "$1" none "no eGPU attached"; return; }
+    if gamescope_on_egpu; then
+        answer "$1" failed "Game Mode is still running on the eGPU"
+        return
+    fi
+    mapfile -t nodes < <(egpu_nodes "$gpu")
+    # Removing a GPU or sound card that a program still has open can hang the kernel.
+    for ((i = 0; i < 15; i++)); do
+        held=$(held_by "${nodes[@]}")
+        [ -z "$held" ] && break
+        sleep 1
+    done
+    if [ -n "$held" ]; then
+        answer "$1" failed "still in use by: $held"
+        return
+    fi
+    top=$(dock_top "$gpu")
+    log "removing ${top##*/} from the PCI bus"
+    echo 1 > "$top/remove"
+    for ((i = 0; i < 10; i++)); do
+        [ -e "$gpu" ] || break
+        sleep 1
+    done
+    if [ -e "$gpu" ]; then
+        answer "$1" failed "the eGPU is still on the PCI bus"
+        return
+    fi
+    answer "$1" ok "removed ${top##*/} and everything behind it"
+}
+
+attach() {
+    local i
+    echo 1 > /sys/bus/pci/rescan
+    for ((i = 0; i < 20; i++)); do
+        find_egpu > /dev/null && break
+        sleep 1
+    done
+    if find_egpu > /dev/null; then
+        answer "$1" ok "eGPU attached"
+    else
+        answer "$1" failed "no eGPU found after a PCI rescan"
+    fi
+}
+
+[ -p "$FIFO" ] || mkfifo "$FIFO"
+chgrp deck "$FIFO"
+chmod 0620 "$FIFO"
+# Read-write, so the FIFO never reads as closed between writers.
+exec 3<> "$FIFO"
+while read -r cmd token <&3; do
+    case $cmd in
+        game-mode-on-egpu) panel_off; continue ;;
+        fence|unfence|eject|attach) ;;
+        *) continue ;;
+    esac
+    case $token in ''|*[!0-9]*) continue ;; esac
+    "$cmd" "$token"
+done

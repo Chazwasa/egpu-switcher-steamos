@@ -4,6 +4,8 @@ Zero-config eGPU manager for SteamOS. Automatically detects your eGPU at every b
 
 Works with any eGPU dock (USB4, Thunderbolt, OCuLink) on any SteamOS device. Tested on the Lenovo Legion Go S.
 
+**In development:** plugging in and ejecting the eGPU without restarting, in Game Mode. See [hotswap/README.md](hotswap/README.md).
+
 ## How it works
 
 On every boot, a systemd service scans for connected eGPUs. If one is found, it bind-mounts `boot_vga=1` onto the eGPU and `boot_vga=0` onto the iGPU before the display manager starts. This tells SteamOS to treat the eGPU as the primary GPU.

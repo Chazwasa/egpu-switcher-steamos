@@ -1,0 +1,16 @@
+[Unit]
+Description=egpu-switcher root helper: turns the built-in screen off while Game Mode is on the eGPU
+
+[Service]
+ExecStart=/etc/egpu-switcher/helper
+RuntimeDirectory=egpu-switcher
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+#!/bin/bash
+# egpu-switcher: moves Game Mode between the built-in GPU and the eGPU when a monitor or the eGPU is plugged
+# in or out. Run by egpu-switcher-watch.service (user unit).
+#
+# gamescope cannot change GPU while it runs, so a move restarts Game Mode. A move onto the eGPU waits until no
+# game is running, so plugging in a monitor never closes a game. A move off the eGPU happens straight away:
+# its monitor is gone, so the game cannot be seen anyway.
+
+SESSION="$HOME/.local/lib/egpu-switcher/gamescope-session"
+STATE_FILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/egpu-switcher-gpu"
+SETTLE=3      # seconds without display events before acting, so one plug-in restarts Game Mode once
+GAME_POLL=5   # seconds between checks while a move waits for a game to close
+
+log() { echo "$*" >&2; }
+
+game_running() { pgrep -f 'SteamLaunch AppId=' > /dev/null; }
+
+# Returns 1 while a move onto the eGPU is waiting for a game to close.
+evaluate() {
+    local have kind bdf want
+    systemctl --user is-active -q gamescope-session.service || return 0
+    # Only Game Mode started through the wrapper writes the state file.
+    have=$(cat "$STATE_FILE" 2> /dev/null) || return 0
+    read -r kind bdf _ <<< "$("$SESSION" --check)"
+    want=$kind
+    [ "$kind" = egpu ] && want="egpu $bdf"
+    [ "$want" = "$have" ] && return 0
+    [ "$kind" = egpu ] && game_running && return 1
+    log "moving Game Mode from \"$have\" to \"$want\""
+    systemctl --user restart gamescope-session.target || log "restarting Game Mode failed"
+    return 0
+}
+
+# 1 while a move waits for a game to close: check again every GAME_POLL seconds. It starts at 1 so the first check
+# runs even without a display event, for an eGPU that appeared before this service started (at boot).
+waiting=1
+while :; do
+    if [ "$waiting" = 1 ]; then
+        read -r -t "$GAME_POLL" line
+    else
+        read -r line
+    fi
+    rc=$?
+    # udevadm has exited; systemd restarts the service.
+    [ "$rc" = 1 ] && exit 1
+    if [ "$rc" = 0 ]; then
+        case $line in "UDEV  ["*) ;; *) continue ;; esac
+        while read -r -t "$SETTLE" _; do :; done
+    fi
+    if evaluate; then
+        waiting=0
+    else
+        [ "$waiting" = 1 ] || log "monitor on the eGPU connected: Game Mode moves to it when the game closes"
+        waiting=1
+    fi
+done < <(udevadm monitor --udev --subsystem-match=drm)

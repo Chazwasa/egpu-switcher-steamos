@@ -1,0 +1,10 @@
+[Unit]
+Description=egpu-switcher: eject the eGPU when Volume Up, Down, Up, Down is tapped
+
+[Service]
+ExecStart=%h/.local/lib/egpu-switcher/buttons
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
