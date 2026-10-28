@@ -34,7 +34,8 @@ There is a sound for each as well, when the volume is up. To use an ejected eGPU
 
 Pulling the eGPU while Game Mode uses it hits a bug in AMD's driver (amdgpu, on this kernel): the driver waits for GPU
 work that can never finish, and part of the kernel stays stuck. Game Mode comes back on the handheld after 10 seconds
-to a minute, but the eGPU cannot be used again until a restart, and a normal restart hangs on the stuck GPU.
+to a minute, but the eGPU cannot be used again until a restart, and a normal restart hangs on the stuck GPU. Reported
+to Valve as [ValveSoftware/SteamOS#3002](https://github.com/ValveSoftware/SteamOS/issues/3002).
 
 If it happens anyway, the joystick lights **flash red** about 20 seconds after the pull (and again if you plug the dock
 back in). Tap the pattern, then tap it again while the lights flash amber and red: the lights go solid red, and the
