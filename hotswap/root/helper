@@ -5,8 +5,10 @@
 #   game-mode-on-egpu  From the session wrapper. While Game Mode runs on the eGPU nothing drives the built-in screen,
 #                      so the kernel's framebuffer console lights it (backlight on, picture black); this turns it off.
 #                      Decided by gamescope's own command line, not by the message.
-#   fence TOKEN        First step of a safe eject: the eGPU's device files can no longer be opened, so programs
-#                      restarted after this leave the eGPU alone.
+#   fence TOKEN        Part of a safe eject: the eGPU's device files can no longer be opened, so programs
+#                      restarted after this leave the eGPU alone. The session wrapper asks for it between the old
+#                      Game Mode session and the new one.
+#   fence-sound TOKEN  The same for the eGPU's HDMI/DP audio only, before PipeWire is restarted.
 #   unfence TOKEN      Undoes fence, for an eject that did not go ahead.
 #   eject TOKEN        Takes the eGPU off the PCI bus once nothing has it open.
 #   attach TOKEN       Brings an ejected eGPU back without replugging (PCI rescan).
@@ -142,12 +144,13 @@ panel_off() {
     done
 }
 
+# fence TOKEN [PREFIX]: only the device files under PREFIX, if given
 fence() {
     local gpu nodes
     gpu=$(find_egpu) || { answer "$1" none "no eGPU attached"; return; }
-    mapfile -t nodes < <(egpu_nodes "$gpu")
+    mapfile -t nodes < <(egpu_nodes "$gpu" | grep -F "${2:-/dev/}")
     # Mode 000 also clears the ACL mask, which switches off the access logind grants the logged-in user.
-    chmod 000 "${nodes[@]}"
+    [ "${#nodes[@]}" -gt 0 ] && chmod 000 "${nodes[@]}"
     answer "$1" ok "fenced ${nodes[*]}"
 }
 
@@ -236,10 +239,14 @@ chmod 0620 "$FIFO"
 exec 3<> "$FIFO"
 while read -r cmd token <&3; do
     case $cmd in
-        game-mode-on-egpu) panel_off; continue ;;
-        fence|unfence|eject|attach|restart) ;;
+        # In the background: it takes up to 45 seconds, and the session wrapper needs fence answered at once.
+        game-mode-on-egpu) panel_off & continue ;;
+        fence|fence-sound|unfence|eject|attach|restart) ;;
         *) continue ;;
     esac
     case $token in ''|*[!0-9]*) continue ;; esac
-    "$cmd" "$token"
+    case $cmd in
+        fence-sound) fence "$token" /dev/snd/ ;;
+        *) "$cmd" "$token" ;;
+    esac
 done

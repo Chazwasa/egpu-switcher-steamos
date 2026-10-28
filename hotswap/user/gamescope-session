@@ -18,10 +18,26 @@ STARTS_FILE="$RUNTIME_DIR/egpu-switcher-starts"
 STATE_FILE="$RUNTIME_DIR/egpu-switcher-gpu"
 # Present while the eject command runs: Game Mode starts on the built-in GPU.
 HOLD_FILE="$RUNTIME_DIR/egpu-switcher-hold"
-# Read by the root helper (egpu-switcher-helper.service), which turns the built-in screen off.
+# Read by the root helper (egpu-switcher-helper.service), which turns the built-in screen off and fences the eGPU.
 HELPER_FIFO=/run/egpu-switcher/cmd
+HELPER_RESULT=/run/egpu-switcher/result
 
 log() { echo "egpu-switcher: $*" >&2; }
+
+# During an eject: makes the eGPU's device files unopenable before this session starts. Done here, between the old
+# session and this one, because before the old session stopped its Xwayland could still need them on the way out,
+# and once this one starts, Steam and gamescope would open them. systemd allows the session 5 seconds to start, so
+# this waits at most 2.
+fence_egpu() {
+    local token=$RANDOM$RANDOM t answer i
+    # shellcheck disable=SC2016
+    [ -p "$HELPER_FIFO" ] && timeout 1 sh -c 'echo "$1" > "$2"' sh "fence $token" "$HELPER_FIFO" || return
+    for ((i = 0; i < 20; i++)); do
+        read -r t answer 2> /dev/null < "$HELPER_RESULT" && [ "$t" = "$token" ] && { log "fence: $answer"; return; }
+        sleep 0.1
+    done
+    log "fence: no answer from the root helper"
+}
 
 # Prints "BDF VENDOR:DEVICE CARD" for the first removable display-class GPU that has a connected output.
 find_egpu() {
@@ -92,6 +108,7 @@ if [ -n "$egpu" ] && [ -z "$ejecting" ] && [ "$starts" -lt 3 ]; then
 elif [ -n "$ejecting" ]; then
     echo builtin > "$STATE_FILE"
     log "eject in progress: starting on the built-in GPU"
+    fence_egpu
 elif [ -n "$egpu" ]; then
     echo builtin > "$STATE_FILE"
     log "eGPU $egpu failed to start $starts times in the last minute: starting on the built-in GPU"

@@ -37,7 +37,7 @@ fi
 touch "$HOLD_FILE"
 trap 'rm -f "$HOLD_FILE"' EXIT
 
-answer=$(ask_helper fence)
+answer=$(ask_helper fence-sound)
 case $answer in
     ok*) ;;
     none*) echo "${answer#none }"; exit 0 ;;
@@ -46,11 +46,14 @@ esac
 
 echo "moving sound and Game Mode off the eGPU..."
 # Restarted programs can no longer open the eGPU: PipeWire lets go of its HDMI/DP audio, and Game Mode comes back on
-# the built-in screen with Steam, Xwayland and the overlay holding only the built-in GPU.
+# the built-in screen with Steam, Xwayland and the overlay holding only the built-in GPU. The session wrapper fences
+# the eGPU's graphics device files between the old session and the new one.
 systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 if systemctl --user is-active -q gamescope-session.service; then
     systemctl --user restart gamescope-session.target
 fi
+# Outside Game Mode nothing has fenced them yet.
+ask_helper fence > /dev/null
 
 answer=$(ask_helper eject)
 case $answer in
