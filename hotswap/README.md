@@ -89,4 +89,3 @@ sudo rm -r /etc/egpu-switcher /etc/systemd/system/egpu-switcher-helper.service /
 ## Not done yet
 
 - Desktop Mode
-- The PCIe link between the dock and the GPU idles at 2.5 GT/s under light load
