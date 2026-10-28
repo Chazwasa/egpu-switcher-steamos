@@ -7,12 +7,18 @@
 # pattern within 10 seconds confirms. The screen cannot show a message, so the outcome shows on the joystick lights,
 # with a sound as well when the volume is up:
 #   amber, breathing                 ejecting: do not unplug                  sound: information
-#   flashing amber and red           a game is running: repeat the pattern     sound: warning
-#                                    within 10 seconds to eject and close it
+#   flashing amber and red           repeat the pattern within 10 seconds to   sound: warning
+#                                    confirm (a game is running, or a restart)
 #   green, 15 seconds                safe to unplug                           sound: complete
 #   red, 15 seconds (5 if no eGPU)   the eject failed: do not unplug           sound: error
-# Afterwards the lights go back to the user's own setting.
+#   flashing red, 30 seconds         the eGPU was pulled without an eject and  sound: error
+#                                    the kernel is stuck on it (an amdgpu bug):
+#                                    it cannot be used again until a restart
+#   red                              restarting
+# While stuck, the pattern restarts instead of ejecting: the root helper writes everything to disk and restarts at
+# once, because a normal restart hangs on the stuck eGPU. Afterwards the lights go back to the user's own setting.
 import os
+import random
 import select
 import struct
 import subprocess
@@ -21,6 +27,8 @@ import threading
 import time
 
 EJECT = os.path.expanduser("~/.local/lib/egpu-switcher/eject")
+HELPER_FIFO = "/run/egpu-switcher/cmd"
+HELPER_RESULT = "/run/egpu-switcher/result"
 SOUNDS = "/usr/share/sounds/freedesktop/stereo"
 KEY_VOLUMEDOWN = 114
 KEY_VOLUMEUP = 115
@@ -28,6 +36,9 @@ PATTERN = (KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_VOLUMEDOWN)
 PATTERN_SECONDS = 2.0
 CONFIRM_SECONDS = 10.0
 RESULT_SECONDS = 15.0
+STUCK_SECONDS = 30.0
+STUCK_CHECK_SECONDS = 5.0
+STUCK_AFTER_SECONDS = 20.0  # a normal removal takes a few seconds
 EJECT_POLL_SECONDS = 0.5
 RESCAN_SECONDS = 30.0  # picks up a keyboard plugged in later
 
@@ -51,6 +62,11 @@ def play(sound):
     threading.Thread(target=_play, args=(sound,), daemon=True).start()
 
 
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
 class Rings:
     """The joystick lights (hid-lenovo-go-s). The user's own setting is saved at the first signal and put back after.
 
@@ -62,20 +78,17 @@ class Rings:
     AMBER = "100 45 0"
     GREEN = "0 100 0"
     RED = "100 0 0"
+    OFF = "0 0 0"
     FLASH_SECONDS = 0.5
     CHECK_SECONDS = 1.0
 
     def __init__(self):
         self.saved = None
-        self.signal = None  # (effect, speed, color, flashing)
+        self.signal = None  # (effect, speed, color, flash color or None)
         self.until = 0.0  # 0 while a signal lasts until the next one
-        self.flash_red = False
+        self.flashed = False
         self.next_flash = 0.0
         self.next_check = 0.0
-
-    def _read(self, attr):
-        with open(f"{self.PATH}/{attr}") as f:
-            return f.read().strip()
 
     def _write(self, attr, value):
         try:
@@ -85,8 +98,8 @@ class Rings:
             log(f"joystick lights: cannot set {attr}: {e}")
 
     def _color(self):
-        effect, speed, color, flashing = self.signal
-        return self.RED if flashing and self.flash_red else color
+        _, _, color, flash = self.signal
+        return flash if flash and self.flashed else color
 
     def _apply(self):
         effect, speed, _, _ = self.signal
@@ -98,24 +111,24 @@ class Rings:
 
     def _changed(self):
         try:
-            return (self._read("enabled"), self._read("effect"), self._read("multi_intensity")) != (
-                "true", self.signal[0], self._color())
+            shown = (read(f"{self.PATH}/enabled"), read(f"{self.PATH}/effect"), read(f"{self.PATH}/multi_intensity"))
         except OSError:
             return False
+        return shown != ("true", self.signal[0], self._color())
 
-    def show(self, effect, color, seconds=0.0, speed=50, flashing=False):
+    def show(self, effect, color, seconds=0.0, speed=50, flash=None):
         if not os.path.isdir(self.PATH):
             return
         if self.saved is None:
             try:
-                self.saved = {attr: self._read(attr) for attr in self.SAVED}
+                self.saved = {attr: read(f"{self.PATH}/{attr}") for attr in self.SAVED}
             except OSError as e:
                 log(f"joystick lights: cannot read them: {e}")
                 return
         now = time.monotonic()
-        self.signal = (effect, speed, color, flashing)
+        self.signal = (effect, speed, color, flash)
         self.until = now + seconds if seconds else 0.0
-        self.flash_red = False
+        self.flashed = False
         self.next_flash = now + self.FLASH_SECONDS
         self.next_check = now + self.CHECK_SECONDS
         self._apply()
@@ -147,7 +160,7 @@ class Rings:
             self.restore()
             return
         if self.signal[3] and now >= self.next_flash:
-            self.flash_red = not self.flash_red
+            self.flashed = not self.flashed
             self._write("multi_intensity", self._color())
             self.next_flash = now + self.FLASH_SECONDS
         if now >= self.next_check:
@@ -157,10 +170,78 @@ class Rings:
                 self._apply()
 
 
+class Stuck:
+    """Notices when the eGPU was pulled without an eject and the kernel's removal of it is stuck: its hotplug slot
+    reports no card for longer than a removal takes, while the eGPU is still on the PCI bus. That lasts until a restart,
+    so it stays set while the eGPU is on the bus, even after the dock is plugged back in."""
+
+    def __init__(self):
+        self.stuck = False
+        self.no_card_since = None
+        self.card_present = True
+        self.next_check = 0.0
+
+    @staticmethod
+    def _egpu_slot():
+        """(eGPU on the bus, its slot reports a card). The slot is the hotplug slot right below the root port."""
+        for dev in os.listdir("/sys/bus/pci/devices"):
+            path = f"/sys/bus/pci/devices/{dev}"
+            try:
+                if not read(f"{path}/class").startswith(("0x0300", "0x0302", "0x0380")):
+                    continue
+                if read(f"{path}/removable") != "removable":
+                    continue
+            except OSError:
+                continue
+            # /sys/devices/pci0000:00/<root port>/<top>/.../<eGPU>: removing <top> removes the eGPU.
+            parts = os.path.realpath(path).split("/")
+            if len(parts) < 6:
+                continue
+            top = parts[5]
+            for slot in os.listdir("/sys/bus/pci/slots"):
+                try:
+                    if read(f"/sys/bus/pci/slots/{slot}/address") == top.rsplit(".", 1)[0]:
+                        return True, read(f"/sys/bus/pci/slots/{slot}/adapter") != "0"
+                except OSError:
+                    continue
+            return True, True
+        return False, True
+
+    def timeout(self):
+        return max(0.0, self.next_check - time.monotonic())
+
+    def check(self, rings):
+        now = time.monotonic()
+        if now < self.next_check:
+            return
+        self.next_check = now + STUCK_CHECK_SECONDS
+        on_bus, card_present = self._egpu_slot()
+        if not on_bus:
+            self.stuck = False
+            self.no_card_since = None
+        elif self.stuck:
+            if card_present and not self.card_present:
+                log("eGPU plugged back in, but the kernel is still stuck on the old one: restart needed")
+                self.warn(rings)
+        elif card_present:
+            self.no_card_since = None
+        elif self.no_card_since is None:
+            self.no_card_since = now
+        elif now - self.no_card_since >= STUCK_AFTER_SECONDS:
+            log("eGPU pulled without an eject, and the kernel is stuck on it: restart needed")
+            self.stuck = True
+            self.warn(rings)
+        self.card_present = card_present
+
+    @staticmethod
+    def warn(rings):
+        rings.show("monocolor", Rings.RED, STUCK_SECONDS, flash=Rings.OFF)
+        play("dialog-error")
+
+
 def has_volume_keys(event):
     try:
-        with open(f"/sys/class/input/{event}/device/capabilities/key") as f:
-            words = f.read().split()
+        words = read(f"/sys/class/input/{event}/device/capabilities/key").split()
     except OSError:
         return False
     bits = 0
@@ -185,10 +266,8 @@ def egpu_attached():
     for dev in os.listdir("/sys/bus/pci/devices"):
         path = f"/sys/bus/pci/devices/{dev}"
         try:
-            with open(f"{path}/class") as f:
-                display = f.read().startswith(("0x0300", "0x0302", "0x0380"))
-            with open(f"{path}/removable") as f:
-                removable = f.read().strip() == "removable"
+            display = read(f"{path}/class").startswith(("0x0300", "0x0302", "0x0380"))
+            removable = read(f"{path}/removable") == "removable"
         except OSError:
             continue
         if display and removable and os.path.exists(f"{path}/driver"):
@@ -198,6 +277,26 @@ def egpu_attached():
 
 def game_running():
     return subprocess.run(["pgrep", "-f", "SteamLaunch AppId="], capture_output=True).returncode == 0
+
+
+def ask_helper(request):
+    """Sends a request to the root helper (egpu-switcher-helper.service) and returns its answer, "ok|failed DETAIL"."""
+    token = str(random.randrange(10**9))
+    try:
+        fd = os.open(HELPER_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+        os.write(fd, f"{request} {token}\n".encode())
+        os.close(fd)
+    except OSError as e:
+        return f"failed the root helper is not running ({e})"
+    for _ in range(20):
+        try:
+            answered, _, answer = read(HELPER_RESULT).partition(" ")
+            if answered == token:
+                return answer
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return "failed no answer from the root helper"
 
 
 def drain(fds):
@@ -210,18 +309,33 @@ def drain(fds):
             pass
 
 
-def on_pattern(rings, confirm_until):
+def ask_confirmation(rings, what):
+    log(f"{what}: waiting for the pattern again to confirm")
+    rings.show("monocolor", Rings.AMBER, CONFIRM_SECONDS, flash=Rings.RED)
+    play("dialog-warning")
+    return time.monotonic() + CONFIRM_SECONDS
+
+
+def on_pattern(rings, stuck, confirm_until):
     """Acts on a recognized pattern. Returns the new end of the confirmation window and the started eject, if any."""
+    if stuck.stuck:
+        if time.monotonic() > confirm_until:
+            return ask_confirmation(rings, "restart pattern"), None
+        log("restart pattern: restarting")
+        rings.show("monocolor", Rings.RED)
+        answer = ask_helper("restart")
+        log(f"restart: {answer}")
+        if not answer.startswith("ok"):
+            rings.show("monocolor", Rings.RED, RESULT_SECONDS)
+            play("dialog-error")
+        return 0.0, None
     if not egpu_attached():
         log("eject pattern: no eGPU attached")
         rings.show("monocolor", Rings.RED, 5.0)
         play("dialog-error")
         return 0.0, None
     if game_running() and time.monotonic() > confirm_until:
-        log("eject pattern: a game is running, waiting for the pattern again to confirm")
-        rings.show("monocolor", Rings.AMBER, CONFIRM_SECONDS, flashing=True)
-        play("dialog-warning")
-        return time.monotonic() + CONFIRM_SECONDS, None
+        return ask_confirmation(rings, "eject pattern with a game running"), None
     log("eject pattern: ejecting")
     rings.show("breathe", Rings.AMBER)
     play("dialog-information")
@@ -244,15 +358,18 @@ def main():
     confirm_until = 0.0
     ejecting = None
     rings = Rings()
+    stuck = Stuck()
     open_new_devices(fds)
     while True:
-        waits = [RESCAN_SECONDS]
+        waits = [RESCAN_SECONDS, stuck.timeout()]
         if rings.timeout() is not None:
             waits.append(rings.timeout())
         if ejecting:
             waits.append(EJECT_POLL_SECONDS)
         ready, _, _ = select.select(list(fds), [], [], min(waits))
         rings.tick()
+        if not ejecting:
+            stuck.check(rings)
         if ejecting and ejecting.poll() is not None:
             finish_eject(rings, ejecting)
             ejecting = None
@@ -284,7 +401,7 @@ def main():
                 if tuple(c for _, c in presses) != PATTERN or presses[-1][0] - presses[0][0] > PATTERN_SECONDS:
                     continue
                 presses.clear()
-                confirm_until, ejecting = on_pattern(rings, confirm_until)
+                confirm_until, ejecting = on_pattern(rings, stuck, confirm_until)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 #   unfence TOKEN      Undoes fence, for an eject that did not go ahead.
 #   eject TOKEN        Takes the eGPU off the PCI bus once nothing has it open.
 #   attach TOKEN       Brings an ejected eGPU back without replugging (PCI rescan).
+#   restart TOKEN      Restarts at once, only while the eGPU's removal is stuck (see stuck_egpu).
 #
 # A request with a TOKEN is answered in $RESULT as "TOKEN ok|failed|none DETAIL".
 
@@ -74,6 +75,24 @@ dock_top() {
     path=${path#/sys/devices/pci*/}
     path=${path#*/}
     echo "/sys/bus/pci/devices/${path%%/*}"
+}
+
+# The eGPU's hotplug slot reports no card while the eGPU is still on the bus: the kernel's removal of it is stuck. That
+# is an amdgpu bug when the eGPU is unplugged while in use, and only a restart clears it.
+stuck_egpu() {
+    local dev class top slot
+    for dev in /sys/bus/pci/devices/*; do
+        class=$(cat "$dev/class" 2>/dev/null) || continue
+        case "$class" in 0x0300*|0x0302*|0x0380*) ;; *) continue ;; esac
+        [ "$(cat "$dev/removable" 2>/dev/null)" = removable ] || continue
+        top=$(dock_top "$dev")
+        top=${top##*/}
+        for slot in /sys/bus/pci/slots/*; do
+            [ "$(cat "$slot/address" 2>/dev/null)" = "${top%.*}" ] || continue
+            [ "$(cat "$slot/adapter" 2>/dev/null)" = 0 ] && return 0
+        done
+    done
+    return 1
 }
 
 gamescope_on_egpu() {
@@ -193,6 +212,23 @@ attach() {
     fi
 }
 
+# A normal restart, even "reboot -f", hangs: on its way down the kernel waits for the eGPU, which the stuck removal holds.
+# So write everything to disk, make the filesystems read-only, and restart at once, as SysRq S, U, B do.
+restart() {
+    if ! stuck_egpu; then
+        answer "$1" failed "the eGPU is not stuck: use a normal restart"
+        return
+    fi
+    answer "$1" ok "restarting"
+    sync &
+    sleep 3
+    echo s > /proc/sysrq-trigger
+    sleep 2
+    echo u > /proc/sysrq-trigger
+    sleep 2
+    echo b > /proc/sysrq-trigger
+}
+
 [ -p "$FIFO" ] || mkfifo "$FIFO"
 chgrp deck "$FIFO"
 chmod 0620 "$FIFO"
@@ -201,7 +237,7 @@ exec 3<> "$FIFO"
 while read -r cmd token <&3; do
     case $cmd in
         game-mode-on-egpu) panel_off; continue ;;
-        fence|unfence|eject|attach) ;;
+        fence|unfence|eject|attach|restart) ;;
         *) continue ;;
     esac
     case $token in ''|*[!0-9]*) continue ;; esac

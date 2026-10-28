@@ -25,6 +25,7 @@ screen and the eGPU is taken off the PCI bus. The joystick lights say when you c
 | Flashing amber and red | A game is running. Tap the pattern again within 10 seconds to eject and close it; otherwise nothing happens. |
 | Green, 15 seconds | Safe to unplug. |
 | Red, 15 seconds | The eject failed, or there is no eGPU. Do not unplug. |
+| Flashing red, 30 seconds | The eGPU was pulled without an eject: restart needed (see below). |
 
 There is a sound for each as well, when the volume is up. To use an ejected eGPU again, unplug and replug it, or run
 `~/.local/lib/egpu-switcher/eject --attach`.
@@ -32,13 +33,17 @@ There is a sound for each as well, when the volume is up. To use an ejected eGPU
 ## Do not pull the cable without ejecting
 
 Pulling the eGPU while Game Mode uses it hits a bug in AMD's driver (amdgpu, on this kernel): the driver waits for GPU
-work that can never finish, and part of the kernel stays stuck. Game Mode comes back on the handheld after about a
-minute, but the eGPU will not work again until a restart, and the restart itself hangs: hold the power button to switch
-off. The dock can then need its own power cycle before it connects again.
+work that can never finish, and part of the kernel stays stuck. Game Mode comes back on the handheld after 10 seconds
+to a minute, but the eGPU cannot be used again until a restart, and a normal restart hangs on the stuck GPU.
 
-Putting the handheld to sleep and pulling the cable while it sleeps is worse: it hangs on waking.
+If it happens anyway, the joystick lights **flash red** about 20 seconds after the pull (and again if you plug the dock
+back in). Tap the pattern, then tap it again while the lights flash amber and red: the lights go solid red, and the
+handheld writes everything to disk and restarts at once, skipping the step a normal restart hangs on.
 
-The eject avoids this by making sure nothing uses the GPU when it is removed.
+Putting the handheld to sleep and pulling the cable while it sleeps is worse: it hangs on waking, and only holding the
+power button gets out of it.
+
+The eject avoids all of this by making sure nothing uses the GPU when it is removed.
 
 ## How it works
 
@@ -51,8 +56,8 @@ restart of Game Mode.
 | `user/shim/gamescope` | `~/.local/lib/egpu-switcher/shim/` | Adds `--prefer-vk-device` to Valve's gamescope command. |
 | `user/watch` | `~/.local/lib/egpu-switcher/`, run by `egpu-switcher-watch.service` | Watches for monitors and GPUs being plugged in or out, and restarts Game Mode when it should move. |
 | `user/eject` | `~/.local/lib/egpu-switcher/` | The eject: moves Game Mode and sound off the eGPU, then asks the root helper to remove it. |
-| `user/buttons` | `~/.local/lib/egpu-switcher/`, run by `egpu-switcher-buttons.service` | Listens for the volume pattern and drives the joystick lights. |
-| `root/helper` | `/etc/egpu-switcher/`, run by `egpu-switcher-helper.service` | The only part that runs as root. It turns the handheld's screen off while Game Mode is on the eGPU, and does the eject's root steps. It takes requests from a pipe only the `deck` group can write. |
+| `user/buttons` | `~/.local/lib/egpu-switcher/`, run by `egpu-switcher-buttons.service` | Listens for the volume pattern, drives the joystick lights, and notices when the eGPU's port reports no card while the eGPU is still on the bus (the stuck state). |
+| `root/helper` | `/etc/egpu-switcher/`, run by `egpu-switcher-helper.service` | The only part that runs as root. It turns the handheld's screen off while Game Mode is on the eGPU, does the eject's root steps, and the quick restart (SysRq sync, read-only, reboot), which it refuses unless the eGPU is stuck. It takes requests from a pipe only the `deck` group can write. |
 
 Everything outside `/etc` lives in your home folder. SteamOS updates keep `/etc/systemd/system/*.service`, and
 `root/atomic-update-keep.conf` adds `/etc/egpu-switcher/` to what they keep.
@@ -82,7 +87,6 @@ sudo rm -r /etc/egpu-switcher /etc/systemd/system/egpu-switcher-helper.service /
 
 ## Not done yet
 
-- Recovering from an accidental pull without a forced restart, or at least saying that a restart is needed
 - The old session crashes on its way out when you eject during a game (harmless, but untidy)
 - Desktop Mode
 - The PCIe link between the dock and the GPU idles at 2.5 GT/s under light load
