@@ -1,0 +1,7 @@
+#!/bin/bash
+# egpu-switcher: put first in PATH by the session wrapper. Valve's session script runs "gamescope" through PATH,
+# so this is where the eGPU is passed to it. Without EGPU_SWITCHER_VK_DEVICE it changes nothing.
+if [ -n "${EGPU_SWITCHER_VK_DEVICE:-}" ]; then
+    exec /usr/bin/gamescope --prefer-vk-device "$EGPU_SWITCHER_VK_DEVICE" "$@"
+fi
+exec /usr/bin/gamescope "$@"

@@ -1,0 +1,10 @@
+[Unit]
+Description=egpu-switcher: move Game Mode between the built-in GPU and the eGPU on hotplug
+
+[Service]
+ExecStart=%h/.local/lib/egpu-switcher/watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

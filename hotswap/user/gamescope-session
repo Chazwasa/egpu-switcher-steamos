@@ -1,0 +1,120 @@
+#!/bin/bash
+# egpu-switcher: Game Mode session wrapper, run through an ExecStart drop-in for gamescope-session.service.
+#
+# If an eGPU with a connected display is present, Game Mode starts on it: gamescope drives the eGPU and its
+# monitor, and Steam and games render on it. Otherwise Valve's session starts exactly as it would without us.
+# The environment set here reaches Steam because Valve's script writes it to $XDG_RUNTIME_DIR/gamescope-environment,
+# which steam-launcher.service reads.
+#
+#   gamescope-session          start the session (what systemd runs)
+#   gamescope-session --check  print where the next start would go, and exit:
+#                              "egpu BDF VENDOR:DEVICE CARD" or "builtin REASON"
+
+VALVE_SESSION=/usr/lib/steamos/gamescope-session
+SHIM_DIR="$HOME/.local/lib/egpu-switcher/shim"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STARTS_FILE="$RUNTIME_DIR/egpu-switcher-starts"
+# Where Game Mode last started: "egpu BDF" or "builtin". The hotplug watcher compares it with --check.
+STATE_FILE="$RUNTIME_DIR/egpu-switcher-gpu"
+# Present while the eject command runs: Game Mode starts on the built-in GPU.
+HOLD_FILE="$RUNTIME_DIR/egpu-switcher-hold"
+# Read by the root helper (egpu-switcher-helper.service), which turns the built-in screen off and fences the eGPU.
+HELPER_FIFO=/run/egpu-switcher/cmd
+HELPER_RESULT=/run/egpu-switcher/result
+
+log() { echo "egpu-switcher: $*" >&2; }
+
+# During an eject: makes the eGPU's device files unopenable before this session starts. Done here, between the old
+# session and this one, because before the old session stopped its Xwayland could still need them on the way out,
+# and once this one starts, Steam and gamescope would open them. systemd allows the session 5 seconds to start, so
+# this waits at most 2.
+fence_egpu() {
+    local token=$RANDOM$RANDOM t answer i
+    # shellcheck disable=SC2016
+    [ -p "$HELPER_FIFO" ] && timeout 1 sh -c 'echo "$1" > "$2"' sh "fence $token" "$HELPER_FIFO" || return
+    for ((i = 0; i < 20; i++)); do
+        read -r t answer 2> /dev/null < "$HELPER_RESULT" && [ "$t" = "$token" ] && { log "fence: $answer"; return; }
+        sleep 0.1
+    done
+    log "fence: no answer from the root helper"
+}
+
+# Prints "BDF VENDOR:DEVICE CARD" for the first removable display-class GPU that has a connected output.
+find_egpu() {
+    local dev class card conn
+    for dev in /sys/bus/pci/devices/*; do
+        class=$(cat "$dev/class" 2>/dev/null) || continue
+        case "$class" in 0x0300*|0x0302*|0x0380*) ;; *) continue ;; esac
+        [ "$(cat "$dev/removable" 2>/dev/null)" = removable ] || continue
+        [ -L "$dev/driver" ] || continue
+        for card in "$dev"/drm/card*; do
+            [ -d "$card" ] || continue
+            for conn in /sys/class/drm/"${card##*/}"-*; do
+                [ "$(cat "$conn/status" 2>/dev/null)" = connected ] || continue
+                echo "${dev##*/} $(cut -c3- "$dev/vendor"):$(cut -c3- "$dev/device") ${card##*/}"
+                return 0
+            done
+        done
+    done
+    return 1
+}
+
+# A gamescope that cannot start on the eGPU would restart the session in a loop. After three eGPU starts
+# within a minute, start on the built-in GPU instead.
+recent_egpu_starts() {
+    local now t count=0
+    now=$(date +%s)
+    [ -r "$STARTS_FILE" ] || { echo 0; return; }
+    while read -r t; do
+        [ -n "$t" ] && [ $((now - t)) -lt 60 ] && count=$((count + 1))
+    done < "$STARTS_FILE"
+    echo "$count"
+}
+
+egpu=$(find_egpu)
+starts=$(recent_egpu_starts)
+ejecting=
+[ -e "$HOLD_FILE" ] && ejecting=1
+
+if [ "${1:-}" = --check ]; then
+    if [ -n "$ejecting" ]; then
+        echo "builtin eject in progress"
+    elif [ -z "$egpu" ]; then
+        echo "builtin no eGPU with a connected display"
+    elif [ "$starts" -ge 3 ]; then
+        echo "builtin eGPU $egpu failed to start $starts times in the last minute"
+    else
+        echo "egpu $egpu"
+    fi
+    exit 0
+fi
+
+unset EGPU_SWITCHER_VK_DEVICE MESA_VK_DEVICE_SELECT DRI_PRIME
+
+if [ -n "$egpu" ] && [ -z "$ejecting" ] && [ "$starts" -lt 3 ]; then
+    read -r bdf vk_id card <<< "$egpu"
+    date +%s >> "$STARTS_FILE"
+    echo "egpu $bdf" > "$STATE_FILE"
+    # The trailing "!" hides every other GPU from Vulkan and from DRI_PRIME's device list, so nothing in the
+    # session renders on the iGPU and copies across the USB4 link.
+    export EGPU_SWITCHER_VK_DEVICE="$vk_id"
+    export MESA_VK_DEVICE_SELECT="$vk_id!"
+    export DRI_PRIME="pci-${bdf//[:.]/_}!"
+    export PATH="$SHIM_DIR:$PATH"
+    log "starting Game Mode on eGPU $bdf ($vk_id, $card)"
+    # In the background so a stuck helper cannot hold up the session start; systemd allows it 5 seconds.
+    # shellcheck disable=SC2016
+    [ -p "$HELPER_FIFO" ] && timeout 2 sh -c 'echo game-mode-on-egpu > "$1"' sh "$HELPER_FIFO" &
+elif [ -n "$ejecting" ]; then
+    echo builtin > "$STATE_FILE"
+    log "eject in progress: starting on the built-in GPU"
+    fence_egpu
+elif [ -n "$egpu" ]; then
+    echo builtin > "$STATE_FILE"
+    log "eGPU $egpu failed to start $starts times in the last minute: starting on the built-in GPU"
+else
+    echo builtin > "$STATE_FILE"
+    log "no eGPU with a connected display: starting on the built-in GPU"
+fi
+
+exec "$VALVE_SESSION" "$@"

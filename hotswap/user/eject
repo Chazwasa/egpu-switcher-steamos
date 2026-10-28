@@ -1,0 +1,69 @@
+#!/bin/bash
+# egpu-switcher: safe eject. Moves Game Mode and sound off the eGPU, then has the root helper take it off the PCI bus.
+# Pull the USB-C cable only after it prints "safe to unplug". It restarts Game Mode, so from inside Game Mode it has to
+# run in its own unit (systemd-run --user), or the restart ends it.
+#
+#   eject            eject the eGPU
+#   eject --attach   bring an ejected eGPU back without replugging the cable
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+# While present, the session wrapper starts Game Mode on the built-in GPU even with an eGPU monitor connected.
+HOLD_FILE="$RUNTIME_DIR/egpu-switcher-hold"
+FIFO=/run/egpu-switcher/cmd
+RESULT=/run/egpu-switcher/result
+
+# ask_helper REQUEST: sends it to the root helper and prints the answer, "ok|failed|none DETAIL".
+ask_helper() {
+    local token=$RANDOM$RANDOM t answer i
+    # shellcheck disable=SC2016
+    if [ ! -p "$FIFO" ] || ! timeout 2 sh -c 'echo "$1" > "$2"' sh "$1 $token" "$FIFO"; then
+        echo "failed the root helper (egpu-switcher-helper.service) is not running"
+        return
+    fi
+    for ((i = 0; i < 90; i++)); do
+        read -r t answer 2> /dev/null < "$RESULT" && [ "$t" = "$token" ] && { echo "$answer"; return; }
+        sleep 1
+    done
+    echo "failed no answer from the root helper"
+}
+
+if [ "${1:-}" = --attach ]; then
+    answer=$(ask_helper attach)
+    echo "$answer"
+    [ "${answer%% *}" = ok ]
+    exit
+fi
+
+touch "$HOLD_FILE"
+trap 'rm -f "$HOLD_FILE"' EXIT
+
+answer=$(ask_helper fence-sound)
+case $answer in
+    ok*) ;;
+    none*) echo "${answer#none }"; exit 0 ;;
+    *) echo "eject failed: ${answer#failed }"; exit 1 ;;
+esac
+
+echo "moving sound and Game Mode off the eGPU..."
+# Restarted programs can no longer open the eGPU: PipeWire lets go of its HDMI/DP audio, and Game Mode comes back on
+# the built-in screen with Steam, Xwayland and the overlay holding only the built-in GPU. The session wrapper fences
+# the eGPU's graphics device files between the old session and the new one.
+systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
+if systemctl --user is-active -q gamescope-session.service; then
+    systemctl --user restart gamescope-session.target
+fi
+# Outside Game Mode nothing has fenced them yet.
+ask_helper fence > /dev/null
+
+answer=$(ask_helper eject)
+case $answer in
+    ok*)
+        echo "safe to unplug (${answer#ok })"
+        ;;
+    *)
+        echo "eject failed: ${answer#failed }"
+        echo "the eGPU is still attached: do not unplug it"
+        ask_helper unfence > /dev/null
+        exit 1
+        ;;
+esac
