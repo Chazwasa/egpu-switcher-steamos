@@ -1,4 +1,4 @@
-# eGPU hot-swap for SteamOS Game Mode (work in progress)
+# eGPU hot-swap for SteamOS Game Mode
 
 Plug the eGPU in and Game Mode moves to its monitor. Undock with a button pattern, pull the cable, and Game Mode is
 back on the handheld's screen. No restart of the handheld, no Desktop Mode, nothing to click.
@@ -68,13 +68,17 @@ replaces them. Their files are left in place.
 
 ## Install
 
-From a copy of this repository on the handheld:
+In Desktop Mode, open Konsole and paste this (SteamOS has no password by default: if you never set one, run `passwd`
+first):
 
 ```bash
-./hotswap/install.sh
+cd /tmp && rm -rf egpu-switcher-steamos-main && curl -sL https://github.com/Chazwasa/egpu-switcher-steamos/archive/refs/heads/main.tar.gz | tar xz && bash egpu-switcher-steamos-main/hotswap/install.sh
 ```
 
-It asks for your password once, for the root helper. Game Mode uses the eGPU from its next start.
+Or, from a copy of this repository: `./hotswap/install.sh`. Run it again to update.
+
+It asks for your password once, for the root helper. Game Mode uses the eGPU from its next start, so return to Game
+Mode afterwards.
 
 ## Remove
 
