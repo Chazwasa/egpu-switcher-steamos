@@ -80,6 +80,10 @@ Or, from a copy of this repository: `./hotswap/install.sh`. Run it again to upda
 It asks for your password once, for the root helper. Game Mode uses the eGPU from its next start, so return to Game
 Mode afterwards.
 
+If Game Mode stays on the handheld when you plug in the eGPU, run `boltctl list`. A dock that is not stored with
+policy `auto` is not authorized by itself, so its GPU never appears. Enroll it once, with the dock connected:
+`sudo boltctl enroll --policy auto UUID`, with the UUID from `boltctl list`.
+
 ## Remove
 
 ```bash

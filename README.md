@@ -81,7 +81,10 @@ If you previously used **all-ways-egpu** or **egpu-manager**, the installer auto
 
 ### Troubleshooting
 
-**eGPU not detected after boot:** Check the log with `egpu-switcher.sh status` or via the GUI. The service waits up to 15 seconds for the eGPU to appear — some docks take longer to initialize. If yours does, you can increase `MAX_RETRY` or `BOOT_DELAY` at the top of the script.
+**eGPU not detected after boot:** Check the log with `egpu-switcher.sh status` or via the GUI.
+
+- If the log says a Thunderbolt/USB4 device is connected but not authorized, run the `boltctl enroll` command it prints, once, with the dock connected. Where the Thunderbolt security level is `user`, boltd only authorizes a dock by itself if it is enrolled with policy `auto`; until then the eGPU does not appear. `boltctl list` shows each dock and its policy.
+- The service waits up to 15 seconds for the eGPU to appear — some docks take longer to initialize. If yours does, increase `MAX_RETRY` or `BOOT_DELAY` at the top of `~/bin/egpu-switcher.sh`, the copy that runs at boot. Running the installer again replaces it with the copy you run it from.
 
 **Password prompt during install:** The script uses `pkexec` to install systemd services, which requires your user password. On a stock SteamOS install, the default password is usually empty or `deck`.
 
