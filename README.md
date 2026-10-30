@@ -25,6 +25,8 @@ switcher below installed, the installer turns its services off.
 
 ## Previous version: boot-time switcher (v2)
 
+**No longer maintained.** It still works as before, but problems with it won't be fixed.
+
 `egpu-switcher.sh` picks the GPU once per boot instead: it detects the eGPU at boot and sets it as the primary GPU
 using `boot_vga` bind mounts. Switching needs a restart.
 
