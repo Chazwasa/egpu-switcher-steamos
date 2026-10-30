@@ -20,7 +20,7 @@
 # set -e only for boot/cleanup (systemd paths). GUI must handle errors gracefully.
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 # SteamOS always uses "deck", but this makes forks easier
@@ -49,6 +49,7 @@ GPU_DRI_CARD=()
 GPU_DRIVER=()
 GPU_NAME=()
 GPU_SYSFS_DEPTH=()
+GPU_REMOVABLE=()
 IGPU_IDX=-1
 EGPU_IDX=-1
 
@@ -92,10 +93,11 @@ discover_gpus() {
     GPU_DRIVER=()
     GPU_NAME=()
     GPU_SYSFS_DEPTH=()
+    GPU_REMOVABLE=()
     IGPU_IDX=-1
     EGPU_IDX=-1
 
-    local dev bus_id class boot_vga dri_card driver name sysfs_depth
+    local dev bus_id class boot_vga dri_card driver name sysfs_depth removable
 
     for dev in /sys/bus/pci/devices/*; do
         [ -f "$dev/class" ] || continue
@@ -135,18 +137,32 @@ discover_gpus() {
         # Sysfs path depth — eGPUs are deeper (more bridges in the chain)
         sysfs_depth=$(readlink -f "$dev" | tr -cd '/' | wc -c)
 
+        # The kernel marks devices behind a USB4/Thunderbolt port as removable
+        removable=0
+        [ -f "$dev/removable" ] && [ "$(<"$dev/removable")" = "removable" ] && removable=1
+
         GPU_BUS_IDS+=("$bus_id")
         GPU_BOOT_VGA+=("$boot_vga")
         GPU_DRI_CARD+=("$dri_card")
         GPU_DRIVER+=("$driver")
         GPU_NAME+=("$name")
         GPU_SYSFS_DEPTH+=("$sysfs_depth")
+        GPU_REMOVABLE+=("$removable")
     done
 
     local i
 
+    # If any GPU is removable, the eGPU is a removable one and the iGPU is not. boot_vga alone can't tell:
+    # firmware may give boot_vga=1 to an eGPU that is connected at power-on, and a non-VGA iGPU has no boot_vga.
+    # Docks the kernel doesn't mark removable (e.g. OCuLink) keep the boot_vga/depth heuristic.
+    local any_removable=0
+    for i in "${!GPU_BUS_IDS[@]}"; do
+        [ "${GPU_REMOVABLE[$i]}" -eq 1 ] && any_removable=1
+    done
+
     # Identify iGPU: the GPU with boot_vga=1
     for i in "${!GPU_BUS_IDS[@]}"; do
+        [ "${GPU_REMOVABLE[$i]}" -eq 1 ] && continue
         if [ "${GPU_BOOT_VGA[$i]}" = "1" ]; then
             IGPU_IDX=$i
             break
@@ -157,6 +173,7 @@ discover_gpus() {
     if [ "$IGPU_IDX" -eq -1 ] && [ "${#GPU_BUS_IDS[@]}" -gt 0 ]; then
         local min_depth=99999
         for i in "${!GPU_BUS_IDS[@]}"; do
+            [ "${GPU_REMOVABLE[$i]}" -eq 1 ] && continue
             if [ "${GPU_SYSFS_DEPTH[$i]}" -lt "$min_depth" ]; then
                 min_depth="${GPU_SYSFS_DEPTH[$i]}"
                 IGPU_IDX=$i
@@ -164,9 +181,14 @@ discover_gpus() {
         done
     fi
 
-    # Identify eGPU: has DRI device, real driver, is not the iGPU
+    # Only removable GPUs: nothing to switch away from
+    [ "$IGPU_IDX" -eq -1 ] && return 0
+
+    # Identify eGPU: has DRI device, real driver, is not the iGPU, and is removable if any GPU is.
+    # While a removable GPU's driver is still loading at boot, this finds nothing and do_boot retries.
     for i in "${!GPU_BUS_IDS[@]}"; do
         [ "$i" -eq "$IGPU_IDX" ] && continue
+        [ "$any_removable" -eq 1 ] && [ "${GPU_REMOVABLE[$i]}" -eq 0 ] && continue
         [ -z "${GPU_DRI_CARD[$i]}" ] && continue
         [ "${GPU_DRIVER[$i]}" = "none" ] && continue
         EGPU_IDX=$i
@@ -200,7 +222,9 @@ build_status() {
 
         status_text+="${label}\n"
         status_text+="  ${GPU_NAME[$i]}\n"
-        status_text+="  Bus: ${GPU_BUS_IDS[$i]}  |  boot_vga: ${GPU_BOOT_VGA[$i]}  |  Driver: ${GPU_DRIVER[$i]}\n"
+        local removable_text="no"
+        [ "${GPU_REMOVABLE[$i]}" -eq 1 ] && removable_text="yes"
+        status_text+="  Bus: ${GPU_BUS_IDS[$i]}  |  boot_vga: ${GPU_BOOT_VGA[$i]}  |  Driver: ${GPU_DRIVER[$i]}  |  Removable: ${removable_text}\n"
         if [ -n "${GPU_DRI_CARD[$i]}" ]; then
             status_text+="  DRI: ${GPU_DRI_CARD[$i]}\n"
         else
@@ -251,6 +275,23 @@ build_status() {
     echo -e "$status_text"
 }
 
+# ─── Unauthorized docks ──────────────────────────────────────────────────────
+# With Thunderbolt security level "user", a dock's PCIe link (and so its GPU) only comes up once boltd authorizes
+# it. boltd does that by itself only for docks enrolled with policy "auto".
+log_unauthorized_docks() {
+    local dev uuid vendor device
+    for dev in /sys/bus/thunderbolt/devices/*; do
+        [ -f "$dev/authorized" ] || continue
+        [ "$(<"$dev/authorized")" = "0" ] || continue
+        uuid="<uuid>"; vendor=""; device=""
+        [ -f "$dev/unique_id" ] && uuid=$(<"$dev/unique_id")
+        [ -f "$dev/vendor_name" ] && vendor=$(<"$dev/vendor_name")
+        [ -f "$dev/device_name" ] && device=$(<"$dev/device_name")
+        log "Thunderbolt/USB4 device ${vendor} ${device} is connected but not authorized, so its GPU can't appear."
+        log "  To authorize it at every boot, run once: sudo boltctl enroll --policy auto ${uuid}"
+    done
+}
+
 # ─── Boot: swap boot_vga flags ──────────────────────────────────────────────
 do_boot() {
     set -e  # strict mode for boot path — failures should be visible in journal
@@ -290,6 +331,7 @@ do_boot() {
 
     if [ "$EGPU_IDX" -lt 0 ]; then
         log "No eGPU detected after ${MAX_RETRY} retries. Booting with iGPU only."
+        log_unauthorized_docks
         log "This is normal if the eGPU dock is not connected."
         exit 0
     fi
